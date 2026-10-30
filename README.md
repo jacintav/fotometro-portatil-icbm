@@ -1,5 +1,6 @@
 # fotómetro-portátil-icbm
 Proyecto de electrónica biomédica: fotómetro portátil para análisis de muestras. Grupo 8
+
 Equipo: Ivette Avila, Isidora Hernández y Jacinta Vallejos.
 
 Prototipo educativo de bajo costo que ilumina una muestra líquida con un LED, mide la luz que la atraviesa con un sensor TEMT6000 y calcula la transmitancia relativa usando una medición previa de blanco. El resultado se muestra por comunicación serial en el computador. El firmware avisa si el sensor se satura o no detecta señal. Es solo para uso formativo, no para análisis clínico.
