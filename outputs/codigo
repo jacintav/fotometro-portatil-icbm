@@ -1,0 +1,235 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ==========================================
+// CONFIGURACIÓN DE PANTALLA OLED SSD1306
+// ==========================================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define SCREEN_ADDRESS 0x3C // Dirección I2C estándar (o 0x3D en algunas placas)
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ==========================================
+// DEFINICIÓN DE PINES (Hardware asignado)
+// ==========================================
+const int PIN_LED_DRIVER = 25; // Excitación base transistor NPN (driver LED)
+const int PIN_SENSOR_SIG = 34; // Entrada analógica ADC (TEMT6000)
+const int PIN_BTN_BLANCO = 26; // Pulsador Calibración / Blanco (Activo LOW)
+const int PIN_BTN_MEDIR  = 27; // Pulsador Iniciar Medición (Activo LOW)
+
+// ==========================================
+// VARIABLES DE ADQUISICIÓN Y FOTOMETRÍA
+// ==========================================
+float valorBlanco = 0.0;       // I0 (medición de referencia con blanco)
+bool blancoCalibrado = false;  // Bandera de calibración previa
+const int NUM_MUESTRAS = 50;   // Promediado para reducir ruido analógico
+
+// Prototipos de funciones
+float adquirirSensorFiltrado();
+void mostrarInicio();
+void mostrarBlanco(float i0);
+void mostrarResultado(float i, float t, float a);
+void mostrarAlerta(const char* mensaje);
+
+void setup() {
+  Serial.begin(115200);
+
+  // Configuración de pines de entrada/salida
+  pinMode(PIN_LED_DRIVER, OUTPUT);
+  digitalWrite(PIN_LED_DRIVER, LOW); // LED apagado inicialmente
+
+  // Pines de pulsadores con resistencia pull-up interna del ESP32
+  pinMode(PIN_BTN_BLANCO, INPUT_PULLUP);
+  pinMode(PIN_BTN_MEDIR, INPUT_PULLUP);
+
+  // Inicialización de la pantalla OLED I2C (SDA=21, SCL=22 por defecto)
+  Wire.begin(21, 22);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println(F("[ERROR] No se pudo inicializar la pantalla SSD1306."));
+    while (true); // Bloqueo si hay fallo en la pantalla
+  }
+
+  // Configuración de resolución ADC del ESP32 (12 bits: 0 a 4095)
+  analogReadResolution(12);
+
+  mostrarInicio();
+  Serial.println(F("--- FOTÓMETRO BIOMÉDICO EDUCATIVO INICIADO ---"));
+  Serial.println(F("Presiona BTN Blanco (GPIO26) para calibrar referencia."));
+}
+
+void loop() {
+  // -------------------------------------------------------------
+  // BOTÓN 1: CALIBRACIÓN DE BLANCO (TARA / I0)
+  // -------------------------------------------------------------
+  if (digitalRead(PIN_BTN_BLANCO) == LOW) {
+    delay(50); // Antirrebote (debounce)
+    if (digitalRead(PIN_BTN_BLANCO) == LOW) {
+      // Enciende el LED para adquirir
+      digitalWrite(PIN_LED_DRIVER, HIGH);
+      delay(80); // Estabilización térmica y óptica
+
+      float lectura = adquirirSensorFiltrado();
+
+      digitalWrite(PIN_LED_DRIVER, LOW); // Apaga LED
+
+      // Detección de condiciones inválidas (saturación o desconexión)
+      if (lectura < 50.0) {
+        mostrarAlerta("ERROR: LUZ BAJA\nRevise cubeta/LED");
+        Serial.println(F("[ERROR] Nivel de luz de referencia insuficiente."));
+      } else if (lectura > 4050.0) {
+        mostrarAlerta("ERROR: SATURADO\nLuz excesiva");
+        Serial.println(F("[ERROR] Sensor saturado."));
+      } else {
+        valorBlanco = lectura;
+        blancoCalibrado = true;
+        mostrarBlanco(valorBlanco);
+        Serial.print(F("[CAL] Blanco registrado exitosamente. I0 = "));
+        Serial.println(valorBlanco);
+      }
+
+      // Espera a que se suelte el pulsador
+      while (digitalRead(PIN_BTN_BLANCO) == LOW) delay(10);
+    }
+  }
+
+  // -------------------------------------------------------------
+  // BOTÓN 2: MEDIDOR DE MUESTRA (I)
+  // -------------------------------------------------------------
+  if (digitalRead(PIN_BTN_MEDIR) == LOW) {
+    delay(50); // Antirrebote
+    if (digitalRead(PIN_BTN_MEDIR) == LOW) {
+      if (!blancoCalibrado) {
+        mostrarAlerta("CALIBRE BLANCO\nPRIMERO");
+        Serial.println(F("[AVISO] Debe registrar el blanco antes de medir una muestra."));
+      } else {
+        digitalWrite(PIN_LED_DRIVER, HIGH);
+        delay(80); // Estabilización óptica
+
+        float valorMuestra = adquirirSensorFiltrado();
+
+        digitalWrite(PIN_LED_DRIVER, LOW); // Apagar LED
+
+        // Cálculo de transmitancia relativa: T = I / I0
+        float transmitancia = valorMuestra / valorBlanco;
+        if (transmitancia > 1.0) transmitancia = 1.0; // Restricción lógica por pequeñas fluctuaciones
+        if (transmitancia < 0.0) transmitancia = 0.0;
+
+        // Cálculo de Absorbancia: A = -log10(T)
+        float absorbancia = 0.0;
+        if (transmitancia > 0.0001) {
+          absorbancia = -log10(transmitancia);
+        } else {
+          absorbancia = 3.0; // Techo si la luz es absorbida completamente
+        }
+
+        mostrarResultado(valorMuestra, transmitancia, absorbancia);
+
+        // Envío de telemetría detallada por puerto Serial para software en PC
+        Serial.print(F("MUESTRA: I="));
+        Serial.print(valorMuestra);
+        Serial.print(F(" | I0="));
+        Serial.print(valorBlanco);
+        Serial.print(F(" | T="));
+        Serial.print(transmitancia * 100.0, 2);
+        Serial.print(F("% | Abs="));
+        Serial.println(absorbancia, 3);
+      }
+
+      while (digitalRead(PIN_BTN_MEDIR) == LOW) delay(10);
+    }
+  }
+}
+
+// ==========================================
+// FUNCIÓN DE ADQUISICIÓN Y SOBREMUESTREO
+// ==========================================
+float adquirirSensorFiltrado() {
+  long suma = 0;
+  for (int i = 0; i < NUM_MUESTRAS; i++) {
+    suma += analogRead(PIN_SENSOR_SIG);
+    delayMicroseconds(200);
+  }
+  return (float)suma / (float)NUM_MUESTRAS;
+}
+
+// ==========================================
+// FUNCIONES DE INTERFAZ GRÁFICA (OLED)
+// ==========================================
+void mostrarInicio() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(10, 5);
+  display.println(F("FOTOMETRO PORTATIL"));
+  display.drawFastHLine(0, 16, 128, SSD1306_WHITE);
+  display.setCursor(0, 24);
+  display.println(F("Equipo listo."));
+  display.setCursor(0, 40);
+  display.println(F("1. Colocar blanco"));
+  display.setCursor(0, 52);
+  display.println(F("2. Presionar BLANCO"));
+  display.display();
+}
+
+void mostrarBlanco(float i0) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(15, 5);
+  display.println(F("BLANCO CALIBRADO"));
+  display.drawFastHLine(0, 16, 128, SSD1306_WHITE);
+  display.setCursor(0, 28);
+  display.println(F("Referencia I0:"));
+  display.setTextSize(2);
+  display.setCursor(20, 44);
+  display.print((int)i0);
+  display.display();
+}
+
+void mostrarResultado(float i, float t, float a) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  
+  // Encabezado
+  display.setTextSize(1);
+  display.setCursor(18, 0);
+  display.println(F("RESULTADO MUESTRA"));
+  display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
+
+  // Transmitancia en grande (%)
+  display.setCursor(0, 16);
+  display.print(F("T: "));
+  display.setTextSize(2);
+  display.print(t * 100.0, 1);
+  display.println(F(" %"));
+
+  // Absorbancia e intensidad cruda
+  display.setTextSize(1);
+  display.setCursor(0, 38);
+  display.print(F("Abs (OD): "));
+  display.print(a, 3);
+
+  display.setCursor(0, 50);
+  display.print(F("I: "));
+  display.print((int)i);
+  display.print(F(" / I0: "));
+  display.print((int)valorBlanco);
+
+  display.display();
+}
+
+void mostrarAlerta(const char* mensaje) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(25, 5);
+  display.println(F("[ ADVERTENCIA ]"));
+  display.drawFastHLine(0, 16, 128, SSD1306_WHITE);
+  display.setCursor(0, 30);
+  display.println(mensaje);
+  display.display();
+  delay(1800);
+}
