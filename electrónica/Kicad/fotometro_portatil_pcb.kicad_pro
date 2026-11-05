@@ -302,7 +302,7 @@
       "netlist": "",
       "plot": "",
       "specctra_dsn": "",
-      "step": "",
+      "step": "fotometro_portatil_pcb.step",
       "vrml": ""
     },
     "page_layout_descr_file": ""
